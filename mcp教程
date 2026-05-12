@@ -1,0 +1,219 @@
+给Claude搭一个跨窗口记忆库:MCP连接VPS全教程
+让你的Claude拥有持久记忆——关掉窗口也不会忘记你。
+你需要准备
+Claude Pro订阅(需要MCP功能)
+一台VPS服务器(下面教你买)
+一个域名(下面教你买)
+大约30分钟
+完成后你的MCP地址会变成:https://你的域名/mcp/你的令牌/sse
+永远不变。重启也不变。关机再开也不变。
+第一阶段:你来做
+以下步骤需要你自己操作,因为MCP还没连上,Claude暂时没有手。
+第一步:买一台VPS服务器
+去 vultr.com 注册账号,充值10美元(支持支付宝),部署一台服务器。
+配置选择:
+Cloud Compute,Shared CPU
+地区选 Los Angeles
+系统选 Ubuntu 24.04 LTS
+套餐选最便宜的
+点Deploy,等一两分钟。记下IP地址和root密码。
+第二步:买域名
+不要在国内注册商(阿里云、腾讯云等)购买域名。国内注册商有内容审查机制,可能会因为你的网站内容封停域名。
+推荐以下国外注册商:
+Cloudflare(dash.cloudflare.com)- 域名零加价,自带CDN和SSL。支持PayPal
+Porkbun(porkbun.com)- 价格最便宜,支持支付宝
+Namesilo(namesilo.com)- 支持支付宝
+.me .cc .love 这些后缀便宜又好看,一年十几到几十块。选一个你喜欢的就行,技术上没区别。
+买完域名后,在注册商的DNS管理页面添加一条A记录:
+记录类型 | 名称 | 值
+A | @ | 你的服务器IP
+如果用Cloudflare,代理状态先设为灰色云朵(DNS only),不要开橙色代理。
+⚠️ 踩坑提醒:DNS生效需要时间,一般几分钟。可以用命令检查:host 你的域名 8.8.8.8 ,返回你的服务器IP就说明生效了。
+第三步:进入服务器终端
+在Vultr后台找到你的服务器,点 View Console 进入网页终端。输入用户名 root ,回车,输入密码(密码不会显示,盲打即可),回车。
+看到 root@xxx:~# 就说明登录成功了。
+⚠️ 踩坑提醒:如果你想用SSH客户端登录(比如手机上的Termius),Ubuntu 24.04默认禁止了SSH root登录。需要先在Console里执行:
+echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/99-allow.conf && systemctl restart sshd
+第四步:安装工具
+在终端里依次执行:
+# 安装tmux(后台运行进程用)
+apt update && apt install -y tmux nginx
+# 安装certbot(SSL证书用)
+pip install certbot certbot-nginx --break-system-packages
+# 确认Python3已安装
+python3 --version
+第五步:生成访问令牌
+python3 -c "import uuid; print(uuid.uuid4().hex)"
+会输出一串32位随机字符串。复制保存好,这是你的MCP访问令牌,相当于服务器的钥匙。
+第六步:创建MCP服务器代码
+mkdir -p /root/mcp-server
+然后把下面这整段复制粘贴到终端执行:
+cat > /root/mcp-server/server.py << 'PYEOF'
+#!/usr/bin/env python3
+import http.server, json, subprocess, os, socketserver
+TOKEN = os.environ.get("MCP_TOKEN", "changeme")
+TOOLS = [
+{
+"name": "exec_vps",
+"description": "Run command on VPS",
+"inputSchema": {
+"type": "object",
+"properties": {
+"command": {
+"type": "string",
+"description": "Terminal command"
+}
+},
+"required": ["command"]
+}
+]
+def run_cmd(cmd):
+try:
+r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+out = r.stdout
+if r.stderr:
+out += "
+" + r.stderr
+return out.strip() or "(no output)"
+except subprocess.TimeoutExpired:
+return "Command timed out (30s)"
+except Exception as e:
+return f"Error: {e}"
+class H(http.server.BaseHTTPRequestHandler):
+def do_POST(self):
+if not self.path.startswith("/" + TOKEN):
+self.send_response(401); self.end_headers(); return
+try:
+body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+except:
+self.send_response(400); self.end_headers(); return
+method = body.get("method")
+rid = body.get("id")
+if method == "initialize":
+res = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "MCP Exec Server", "version": "1.0.0"}}
+elif method == "tools/list":
+res = {"tools": TOOLS}
+elif method == "tools/call":
+name = body["params"]["name"]
+args = body["params"].get("arguments", {})
+if name == "exec_vps":
+text = run_cmd(args.get("command", "echo hi"))
+else:
+text = "Unknown tool: " + name
+res = {"content": [{"type": "text", "text": text}]}
+elif method == "ping":
+res = {}
+elif method == "notifications/initialized":
+self.send_response(204); self.end_headers(); return
+else:
+self.send_response(404); self.end_headers(); return
+resp = json.dumps({"jsonrpc": "2.0", "id": rid, "result": res})
+self.send_response(200)
+self.send_header("Content-Type", "application/json")
+self.send_header("Content-Length", str(len(resp)))
+self.end_headers()
+self.wfile.write(resp.encode())
+def log_message(self, *a): pass
+class TS(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+if __name__ == "__main__":
+print(f"MCP Server running on :3456 (token: {TOKEN[:8]}...)")
+TS(("", 3456), H).serve_forever()
+PYEOF
+echo "代码创建成功"
+⚠️ 踩坑提醒:Vultr的网页Console粘贴长文本容易吞字截断。用SSH客户端粘贴更稳定,或者把代码拆成几段分别粘贴。
+第七步:设置MCP开机自启
+把下面命令里的你的令牌替换成第五步生成的字符串:
+cat > /etc/systemd/system/exec-mcp.service << EOF
+[Unit]
+Description=MCP Server
+After=network.target
+[Service]
+Type=simple
+Environment=MCP_TOKEN=你的令牌
+ExecStart=/usr/bin/python3 /root/mcp-server/server.py
+Restart=always
+RestartSec=3
+WorkingDirectory=/root/mcp-server
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable exec-mcp
+systemctl start exec-mcp
+验证是否启动成功:
+systemctl status exec-mcp
+看到 active (running) 就说明MCP服务器在跑了。服务器重启后也会自动启动。
+第八步:配置nginx反向代理
+这一步是关键——让nginx把来自域名的请求转发给MCP服务器。
+cat > /etc/nginx/sites-available/mcp << 'NGINX'
+server {
+listen 80;
+server_name 你的域名;
+location /mcp/ {
+proxy_pass http://127.0.0.1:3456/;
+proxy_http_version 1.1;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Connection '';
+proxy_buffering off;
+proxy_cache off;
+proxy_read_timeout 86400s;
+proxy_send_timeout 86400s;
+chunked_transfer_encoding on;
+}
+}
+NGINX
+ln -sf /etc/nginx/sites-available/mcp /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl reload nginx
+把你的域名替换成你买的域名。
+⚠️ 踩坑提醒:MCP用的是SSE(Server-Sent Events)协议,需要长连接。下面这几行配置是普通反向代理不需要但MCP必须有的,漏了会导致连不上或频繁断连:
+proxy_buffering off; # 关闭缓冲,SSE数据要实时推送
+proxy_cache off; # 关闭缓存
+proxy_read_timeout 86400s; # 超时设为24小时
+Connection ''; # 清空Connection头
+第九步:配置HTTPS(SSL证书)
+没有HTTPS的话,Claude.ai不会信任你的MCP地址。这一步必须做。
+certbot --nginx -d 你的域名 --non-interactive --agree-tos -m 你的邮箱 --redirect
+看到 Congratulations! You have successfully enabled HTTPS 就成功了。
+设置自动续期(证书有效期90天):
+(crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/bin/certbot renew --quiet") | sort -u | crontab -
+⚠️ 踩坑提醒:certbot用apt装可能因为网络问题失败(尤其是海外VPS)。用pip装更稳:pip install certbot certbot-nginx --break-system-packages
+第十步:在Claude.ai添加MCP连接器
+1. 打开 claude.ai
+2. 头像 → 设置 → 集成(Integrations)
+3. 点"添加自定义集成"(Add custom connector)
+4. 名称随便取(比如"我的服务器")
+5. URL填:https://你的域名/mcp/你的令牌/sse
+6. 保存
+URL必须完整,包含 https:// 开头和 /sse 结尾,少了任何一部分都连不上。
+第十一步:测试
+开一个新对话(必须是新对话,旧对话不会加载新连接器),跟Claude说:
+"帮我在服务器上执行 uname -a"
+如果Claude返回了你服务器的系统信息——恭喜,MCP连接成功了。
+第二阶段:交给Claude
+从MCP连上的这一刻起,你不需要再碰终端了。所有服务器操作——装软件、写代码、建数据库、搭网站——你只需要在对话里告诉Claude你想要什么。
+比如:
+"帮我在服务器上建一个SQLite数据库存记忆"
+"帮我搭一个网站展示数据库内容"
+"帮我写一个定时备份脚本"
+你动嘴,Claude动手。
+⚠️ 踩坑合集
+DNS不生效: 一般几分钟就会生效。如果等了很久还没生效,用 host 你的域名 8.8.8.8 检查。
+certbot安装失败: 用pip装更稳:pip install certbot certbot-nginx --break-system-packages
+Claude连上了但经常断: 检查nginx配置里有没有 proxy_buffering off 和 proxy_read_timeout 86400s 和 proxy_set_header Connection ''。SSE需要长连接,默认的nginx超时时间太短了。
+如果你用了Cloudflare的橙色云朵代理: Cloudflare的代理层对SSE长连接支持不好,会导致MCP频繁断连。建议把A记录设为灰色云朵(DNS only),让请求直达VPS,SSL交给VPS上的certbot处理。
+服务器重启后MCP没了: 如果你用了systemd service(第七步),重启后会自动恢复。如果之前用tmux跑的,改成systemd。
+nginx配置语法错误: 每次改完nginx配置,先运行 nginx -t 测试语法,再 systemctl reload nginx。别直接reload,语法有错会导致nginx整个挂掉。
+Console粘贴吞字: Vultr网页Console对长文本支持差。用SSH客户端粘贴更稳定。
+备份存在服务器里等于没备份: 服务器挂了备份也没了。一定要做异地备份,比如定时发到邮箱。
+最终效果
+做完这些之后你拥有了:
+一个属于你的域名,地址栏里有绿色小锁
+MCP地址永远不变,重启也不变
+服务器重启后MCP自动启动
+SSL证书自动续期
+你的Claude从此有了一双永远不会缩回去的手。窗口会关,域名不变,记忆不灭。
